@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, SecretStr, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from fastapi_keycloak.exceptions import KeycloakError
 
@@ -142,7 +142,7 @@ class OIDCUser(BaseModel):
 
     def __str__(self) -> str:
         """String representation of an OIDCUser"""
-        return self.preferred_username
+        return self.preferred_username or repr(self)
 
 
 class KeycloakIdentityProvider(BaseModel):

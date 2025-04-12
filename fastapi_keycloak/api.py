@@ -1,107 +1,27 @@
-from __future__ import annotations
-
 import functools
 import json
 from json import JSONDecodeError
-from typing import Any, Callable, List, Type, Union
+from typing import Annotated, Any, Awaitable, Callable, List, Optional, Union
 from urllib.parse import urlencode
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import ExpiredSignatureError, JWTError, jwt
 from jose.exceptions import JWTClaimsError
-from pydantic import BaseModel
 from requests import Response
 
-from fastapi_keycloak.exceptions import (
-    ConfigureTOTPException,
-    KeycloakError,
-    MandatoryActionException,
-    UpdatePasswordException,
-    UpdateProfileException,
-    UpdateUserLocaleException,
-    UserNotFound,
-    VerifyEmailException,
-)
-from fastapi_keycloak.model import (
-    HTTPMethod,
-    KeycloakGroup,
-    KeycloakIdentityProvider,
-    KeycloakRole,
-    KeycloakToken,
-    KeycloakUser,
-    OIDCUser,
-)
+from fastapi_keycloak.exceptions import (ConfigureTOTPException, KeycloakError,
+                                         MandatoryActionException,
+                                         UpdatePasswordException,
+                                         UpdateProfileException,
+                                         UpdateUserLocaleException,
+                                         UserNotFound, VerifyEmailException)
+from fastapi_keycloak.model import (HTTPMethod, KeycloakGroup,
+                                    KeycloakIdentityProvider, KeycloakRole,
+                                    KeycloakToken, KeycloakUser, OIDCUser)
 
-
-def result_or_error(
-        response_model: Type[BaseModel] = None, is_list: bool = False
-) -> List[BaseModel] or BaseModel or KeycloakError:
-    """Decorator used to ease the handling of responses from Keycloak.
-
-    Args:
-        response_model (Type[BaseModel]): Object that should be returned based on the payload
-        is_list (bool): True if the return value should be a list of the response model provided
-
-    Returns:
-        BaseModel or List[BaseModel]: Based on the given signature and response circumstances
-
-    Raises:
-        KeycloakError: If the resulting response is not a successful HTTP-Code (>299)
-
-    Notes:
-        - Keycloak sometimes returns empty payloads but describes the error in its content (byte encoded)
-          which is why this function checks for JSONDecode exceptions.
-        - Keycloak often does not expose the real error for security measures. You will most likely encounter:
-          {'error': 'unknown_error'} as a result. If so, please check the logs of your Keycloak instance to get error
-          details, the RestAPI doesn't provide any.
-    """
-
-    def inner(f):
-        @functools.wraps(f)
-        def wrapper(*args, **kwargs):
-            def create_list(json_data: List[dict]):
-                return [response_model.parse_obj(entry) for entry in json_data]
-
-            def create_object(json_data: dict):
-                return response_model.parse_obj(json_data)
-
-            result: Response = f(*args, **kwargs)  # The actual call
-
-            if (
-                    type(result) != Response
-            ):  # If the object given is not a response object, directly return it.
-                return result
-
-            if result.status_code in range(100, 299):  # Successful
-                if response_model is None:  # No model given
-
-                    try:
-                        return result.json()
-                    except JSONDecodeError:
-                        return result.content.decode("utf-8")
-
-                else:  # Response model given
-                    if is_list:
-                        return create_list(result.json())
-                    else:
-                        return create_object(result.json())
-
-            else:  # Not Successful, forward status code and error
-                try:
-                    raise KeycloakError(
-                        status_code=result.status_code, reason=result.json()
-                    )
-                except JSONDecodeError:
-                    raise KeycloakError(
-                        status_code=result.status_code,
-                        reason=result.content.decode("utf-8"),
-                    )
-
-        return wrapper
-
-    return inner
+from .result_or_error import result_or_error
 
 
 class FastAPIKeycloak:
@@ -192,13 +112,13 @@ class FastAPIKeycloak:
             None: Inplace method, updates the _admin_token
         """
         decoded_token = self._decode_token(token=value)
-        if ((not decoded_token.get("resource_access").get(
+        if ((not decoded_token.get("resource_access", {}).get(
                 "realm-management")
             and
-             (not decoded_token.get("resource_access").get(
+             (not decoded_token.get("resource_access", {}).get(
                  "master-realm")) # Keycloak 26 return "master-realm"
                 )
-                or not decoded_token.get("resource_access").get("account")):
+                or not decoded_token.get("resource_access", {}).get("account")):
             raise AssertionError(
                 """The access required was not contained in the access token for the `admin-cli`.
                 Possibly a Keycloak misconfiguration. Check if the admin-cli client has `Full Scope Allowed`
@@ -223,7 +143,7 @@ class FastAPIKeycloak:
         }
 
     @functools.cached_property
-    def user_auth_scheme(self) -> OAuth2PasswordBearer:
+    def user_auth_scheme(self) -> Callable[[Request], Awaitable[Optional[str]]]:
         """Returns the auth scheme to register the endpoints with swagger
 
         Returns:
@@ -231,7 +151,7 @@ class FastAPIKeycloak:
         """
         return OAuth2PasswordBearer(tokenUrl=self.token_uri)
 
-    def get_current_user(self, required_roles: List[str] = None, extra_fields: List[str] = None) -> Callable[OAuth2PasswordBearer, OIDCUser]:
+    def get_current_user(self, required_roles: Optional[List[str]] = None, extra_fields: Optional[List[str]] = None) -> Callable[[str], OIDCUser]:
         """Returns the current user based on an access token in the HTTP-header. Optionally verifies roles are possessed
         by the user
 
@@ -250,7 +170,7 @@ class FastAPIKeycloak:
         """
 
         def current_user(
-                token: OAuth2PasswordBearer = Depends(self.user_auth_scheme),
+                token: Annotated[Optional[str], Depends(self.user_auth_scheme)],
         ) -> OIDCUser:
             """Decodes and verifies a JWT to get the current user
 
@@ -266,7 +186,15 @@ class FastAPIKeycloak:
                 JWTClaimsError: If any claim is invalid
                 HTTPException: If any role required is not contained within the roles of the users
             """
-            decoded_token = self._decode_token(token=token, audience="account")
+
+            if token is None:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No token")
+
+            try:
+                decoded_token = self._decode_token(token=token, audience="account")
+            except JWTError as e:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED) from e
+
             user = OIDCUser.parse_obj(decoded_token)
             if required_roles:
                 for role in required_roles:
@@ -302,8 +230,8 @@ class FastAPIKeycloak:
             self,
             relative_path: str,
             method: HTTPMethod,
-            additional_headers: dict = None,
-            payload: dict = None,
+            additional_headers: Optional[dict] = None,
+            payload: Optional[dict] = None,
     ) -> Response:
         """Proxies a request to Keycloak and automatically adds the required Authorization header. Should not be
         exposed under any circumstances. Grants full API admin access.
@@ -381,7 +309,7 @@ class FastAPIKeycloak:
         return f"-----BEGIN PUBLIC KEY-----\n{public_key}\n-----END PUBLIC KEY-----"
 
     @result_or_error()
-    def add_user_roles(self, roles: List[str], user_id: str) -> dict:
+    def add_user_roles(self, roles: List[str], user_id: str) -> Response:
         """Adds roles to a specific user
 
         Args:
@@ -394,7 +322,8 @@ class FastAPIKeycloak:
         Raises:
             KeycloakError: If the resulting response is not a successful HTTP-Code (>299)
         """
-        keycloak_roles = self.get_roles(roles)
+        keycloak_roles = self.get_roles(roles) or []
+
         return self._admin_request(
             url=f"{self.users_uri}/{user_id}/role-mappings/realm",
             data=[role.__dict__ for role in keycloak_roles],
@@ -402,7 +331,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error()
-    def remove_user_roles(self, roles: List[str], user_id: str) -> dict:
+    def remove_user_roles(self, roles: List[str], user_id: str) -> Response:
         """Removes roles from a specific user
 
         Args:
@@ -415,15 +344,15 @@ class FastAPIKeycloak:
         Raises:
             KeycloakError: If the resulting response is not a successful HTTP-Code (>299)
         """
-        keycloak_roles = self.get_roles(roles)
+        keycloak_roles = self.get_roles(roles) or []
+
         return self._admin_request(
             url=f"{self.users_uri}/{user_id}/role-mappings/realm",
             data=[role.__dict__ for role in keycloak_roles],
             method=HTTPMethod.DELETE,
         )
 
-    @result_or_error(response_model=KeycloakRole, is_list=True)
-    def get_roles(self, role_names: List[str]) -> List[Any] | None:
+    def get_roles(self, role_names: List[str]) -> Optional[List[KeycloakRole]]:
         """Returns full entries of Roles based on role names
 
         Args:
@@ -441,11 +370,12 @@ class FastAPIKeycloak:
         """
         if role_names is None:
             return
+
         roles = self.get_all_roles()
-        return list(filter(lambda role: role.name in role_names, roles))
+        return [role for role in roles if role.name in role_names]
 
     @result_or_error(response_model=KeycloakRole, is_list=True)
-    def get_user_roles(self, user_id: str) -> List[KeycloakRole]:
+    def get_user_roles(self, user_id: str) -> Response:
         """Gets all roles of a user
 
         Args:
@@ -462,7 +392,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error(response_model=KeycloakRole)
-    def create_role(self, role_name: str) -> KeycloakRole:
+    def create_role(self, role_name: str) -> Union[Response, KeycloakRole]:
         """Create a role on the realm
 
         Args:
@@ -478,12 +408,16 @@ class FastAPIKeycloak:
             url=self.roles_uri, data={"name": role_name}, method=HTTPMethod.POST
         )
         if response.status_code == 201:
-            return self.get_roles(role_names=[role_name])[0]
+            roles = self.get_roles(role_names=[role_name])
+            if roles is not None:
+                return roles[0]
+            else:
+                return response ## FIXME
         else:
-            return response
+            return response ## FIXME
 
     @result_or_error(response_model=KeycloakRole, is_list=True)
-    def get_all_roles(self) -> List[KeycloakRole]:
+    def get_all_roles(self) -> Response:
         """Get all roles of the Keycloak realm
 
         Returns:
@@ -495,7 +429,7 @@ class FastAPIKeycloak:
         return self._admin_request(url=self.roles_uri, method=HTTPMethod.GET)
 
     @result_or_error()
-    def delete_role(self, role_name: str) -> dict:
+    def delete_role(self, role_name: str) -> Response:
         """Deletes a role on the realm
 
         Args:
@@ -513,7 +447,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error(response_model=KeycloakGroup, is_list=True)
-    def get_all_groups(self) -> List[KeycloakGroup]:
+    def get_all_groups(self) -> Response:
         """Get all base groups of the Keycloak realm
 
         Returns:
@@ -524,8 +458,7 @@ class FastAPIKeycloak:
         """
         return self._admin_request(url=self.groups_uri, method=HTTPMethod.GET)
 
-    @result_or_error(response_model=KeycloakGroup, is_list=True)
-    def get_groups(self, group_names: List[str]) -> List[Any] | None:
+    def get_groups(self, group_names: List[str]) -> Optional[List[Any]]:
         """Returns full entries of base Groups based on group names
 
         Args:
@@ -542,7 +475,7 @@ class FastAPIKeycloak:
         groups = self.get_all_groups()
         return list(filter(lambda group: group.name in group_names, groups))
 
-    def get_subgroups(self, group: KeycloakGroup, path: str):
+    def get_subgroups(self, group: KeycloakGroup, path: str) -> Optional[KeycloakGroup]:
         """Utility function to iterate through nested group structures
 
         Args:
@@ -552,20 +485,20 @@ class FastAPIKeycloak:
         Returns:
             KeycloakGroup: Keycloak group representation or none if not exists
         """
-        for subgroup in group.subGroups:
+        for subgroup in group.subGroups or []:
             if subgroup.path == path:
                 return subgroup
             elif subgroup.subGroups:
-                for subgroup in group.subGroups:
+                for subgroup in group.subGroups or []:
                     if subgroups := self.get_subgroups(subgroup, path):
                         return subgroups
+
         # Went through the tree without hits
         return None
 
-    @result_or_error(response_model=KeycloakGroup)
     def get_group_by_path(
             self, path: str, search_in_subgroups=True
-    ) -> KeycloakGroup or None:
+    ) -> Optional[KeycloakGroup]:
         """Return Group based on path
 
         Args:
@@ -591,8 +524,10 @@ class FastAPIKeycloak:
                     if res is not None:
                         return res
 
+        return None
+
     @result_or_error(response_model=KeycloakGroup)
-    def get_group(self, group_id: str) -> KeycloakGroup or None:
+    def get_group(self, group_id: str) -> Response:
         """Return Group based on group id
 
         Args:
@@ -615,8 +550,8 @@ class FastAPIKeycloak:
 
     @result_or_error(response_model=KeycloakGroup)
     def create_group(
-            self, group_name: str, parent: Union[KeycloakGroup, str] = None
-    ) -> KeycloakGroup:
+            self, group_name: str, parent: Union[KeycloakGroup, str, None] = None
+    ) -> Union[KeycloakGroup, Response]:
         """Create a group on the realm
 
         Args:
@@ -630,7 +565,7 @@ class FastAPIKeycloak:
             KeycloakError: If the resulting response is not a successful HTTP-Code (>299)
         """
 
-        # If it's an objetc id get an instance of the object
+        # If it's an object id get an instance of the object
         if isinstance(parent, str):
             parent = self.get_group(parent)
 
@@ -645,12 +580,16 @@ class FastAPIKeycloak:
             url=groups_uri, data={"name": group_name}, method=HTTPMethod.POST
         )
         if response.status_code == 201:
-            return self.get_group_by_path(path=path, search_in_subgroups=True)
+            group = self.get_group_by_path(path=path, search_in_subgroups=True)
+            if group is None:
+                return response # FIXME
+            else:
+                return group
         else:
             return response
 
     @result_or_error()
-    def delete_group(self, group_id: str) -> dict:
+    def delete_group(self, group_id: str) -> Response:
         """Deletes a group on the realm
 
         Args:
@@ -668,7 +607,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error()
-    def add_user_group(self, user_id: str, group_id: str) -> dict:
+    def add_user_group(self, user_id: str, group_id: str) -> Response:
         """Add group to a specific user
 
         Args:
@@ -686,7 +625,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error(response_model=KeycloakGroup, is_list=True)
-    def get_user_groups(self, user_id: str) -> List[KeycloakGroup]:
+    def get_user_groups(self, user_id: str) -> Response:
         """Gets all groups of an user
 
         Args:
@@ -702,18 +641,18 @@ class FastAPIKeycloak:
             url=f"{self.users_uri}/{user_id}/groups",
             method=HTTPMethod.GET,
         )
-    
+
     @result_or_error(response_model=KeycloakUser, is_list=True)
-    def get_group_members(self, group_id: str):
+    def get_group_members(self, group_id: str) -> Response:
         """Get all members of a group.
-        
+
         Args:
             group_id (str): ID of the group of interest
 
         Returns:
             List[KeycloakUser]: All users in the group. Note that
             the user objects returned are not fully populated.
-        
+
         Raises:
             KeycloakError: If the resulting response is not a successful HTTP-Code (>299)
         """
@@ -723,7 +662,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error()
-    def remove_user_group(self, user_id: str, group_id: str) -> dict:
+    def remove_user_group(self, user_id: str, group_id: str) -> Response:
         """Remove group from a specific user
 
         Args:
@@ -750,10 +689,10 @@ class FastAPIKeycloak:
             email: str,
             password: str,
             enabled: bool = True,
-            initial_roles: List[str] = None,
+            initial_roles: Optional[List[str]] = None,
             send_email_verification: bool = True,
-            attributes: dict[str, Any] = None,
-    ) -> KeycloakUser:
+            attributes: Optional[dict[str, Any]] = None,
+    ) -> Union[Response, KeycloakUser]:
         """
 
         Args:
@@ -795,6 +734,7 @@ class FastAPIKeycloak:
         )
         if response.status_code != 201:
             return response
+
         user = self.get_user(query=f"username={username}")
         if send_email_verification:
             self.send_email_verification(user.id)
@@ -806,7 +746,7 @@ class FastAPIKeycloak:
     @result_or_error()
     def change_password(
             self, user_id: str, new_password: str, temporary: bool = False
-    ) -> dict:
+    ) -> Response:
         """Exchanges a users' password.
 
         Args:
@@ -835,7 +775,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error()
-    def send_email_verification(self, user_id: str) -> dict:
+    def send_email_verification(self, user_id: str) -> Response:
         """Sends the email to verify the email address
 
         Args:
@@ -852,8 +792,7 @@ class FastAPIKeycloak:
             method=HTTPMethod.PUT,
         )
 
-    @result_or_error(response_model=KeycloakUser)
-    def get_user(self, user_id: str = None, query: str = "") -> KeycloakUser:
+    def get_user(self, user_id: Optional[str] = None, query: str = "") -> KeycloakUser:
         """Queries the keycloak API for a specific user either based on its ID or any **native** attribute
 
         Args:
@@ -911,7 +850,7 @@ class FastAPIKeycloak:
         return response
 
     @result_or_error()
-    def delete_user(self, user_id: str) -> dict:
+    def delete_user(self, user_id: str) -> Response:
         """Deletes an user
 
         Args:
@@ -929,7 +868,7 @@ class FastAPIKeycloak:
         )
 
     @result_or_error(response_model=KeycloakUser, is_list=True)
-    def get_all_users(self) -> List[KeycloakUser]:
+    def get_all_users(self) -> Response:
         """Returns all users of the realm
 
         Returns:
@@ -941,7 +880,7 @@ class FastAPIKeycloak:
         return self._admin_request(url=self.users_uri, method=HTTPMethod.GET)
 
     @result_or_error(response_model=KeycloakIdentityProvider, is_list=True)
-    def get_identity_providers(self) -> List[KeycloakIdentityProvider]:
+    def get_identity_providers(self) -> Response:
         """Returns all configured identity Providers
 
         Returns:
@@ -953,7 +892,7 @@ class FastAPIKeycloak:
         return self._admin_request(url=self.providers_uri, method=HTTPMethod.GET).json()
 
     @result_or_error(response_model=KeycloakToken)
-    def user_login(self, username: str, password: str) -> KeycloakToken:
+    def user_login(self, username: str, password: str) -> Response:
         """Models the password OAuth2 flow. Exchanges username and password for an access token. Will raise detailed
         errors if login fails due to requiredActions
 
@@ -1019,7 +958,7 @@ class FastAPIKeycloak:
     @result_or_error(response_model=KeycloakToken)
     def exchange_authorization_code(
             self, session_state: str, code: str
-    ) -> KeycloakToken:
+    ) -> Response:
         """Models the authorization code OAuth2 flow. Opening the URL provided by `login_uri` will result in a
         callback to the configured callback URL. The callback will also create a session_state and code query
         parameter that can be exchanged for an access token.
@@ -1049,7 +988,7 @@ class FastAPIKeycloak:
             self,
             url: str,
             method: HTTPMethod,
-            data: dict = None,
+            data: Optional[Any] = None,
             content_type: str = "application/json",
     ) -> Response:
         """Private method that is the basis for any requests requiring admin access to the api. Will append the
@@ -1141,7 +1080,7 @@ class FastAPIKeycloak:
         """Returns a openip connect resource URL"""
         return f"{self._open_id}/{resource}"
 
-    def token_is_valid(self, token: str, audience: str = None) -> bool:
+    def token_is_valid(self, token: str, audience: Optional[str] = None) -> bool:
         """Validates an access token, optionally also its audience
 
         Args:
@@ -1158,7 +1097,7 @@ class FastAPIKeycloak:
             return False
 
     def _decode_token(
-            self, token: str, options: dict = None, audience: str = None
+            self, token: str, options: Optional[dict] = None, audience: Optional[str] = None
     ) -> dict:
         """Decodes a token, verifies the signature by using Keycloaks public key. Optionally verifying the audience
 
